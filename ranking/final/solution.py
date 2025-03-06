@@ -2,10 +2,8 @@ from typing import Dict, List, Tuple, Union, Callable
 import os
 import string
 import json
-import pickle
 
 import nltk
-import flask
 import faiss
 import torch
 import torch.nn.functional as F
@@ -52,6 +50,17 @@ def hadle_punctuation(inp_str: str) -> str:
 def simple_preproc(inp_str: str) -> List[str]:
     processed_str = hadle_punctuation(inp_str)
     return nltk.word_tokenize(processed_str.lower())
+
+def text2token_ids(texts: List[str]) -> torch.LongTensor:
+    tokenized = []
+    for text in texts:
+        tokenized_text = simple_preproc(text)
+        token_idxs = [vocab.get(i, vocab["OOV"]) for i in tokenized_text]
+        tokenized.append(token_idxs)
+    max_len = max(len(elem) for elem in tokenized)
+    tokenized = [elem + [0] * (max_len - len(elem)) for elem in tokenized]
+    tokenized = torch.LongTensor(tokenized)    
+    return tokenized
 
 class GaussianKernel(torch.nn.Module):
     def __init__(self, mu: float = 1., sigma: float = 1.):
@@ -152,7 +161,7 @@ def update_index():
     global faiss_index, index_is_ready, documents
     data = request.get_json()
     documents = data.get("documents", {})
-    
+    # nonlocal documents
     if not documents:
         return jsonify({"status": "error", "message": "No documents received"})
     
@@ -174,14 +183,52 @@ def update_index():
     index_is_ready = True
     return jsonify({"status": "ok", "index_size": faiss_index.ntotal})
 
+@app.route("/query", methods=["POST"])
+def get_ranked_candidates():
+    """
+    Принимает POST-запрос. Сначала происходит фильтрация запроса по языку - только английский.
+    Затем происходит поиск вопросов-кандидатов с помощью FAISS (по схожести векторов).
+    Эти кандидаты реранжируются KNRM-моделью, после чего до 10 кандидатов выдаются в качестве ответа.
+    """
+    global knrm_model, faiss_index, vocab
+    if not index_is_ready:
+        return jsonify({"status": 'FAISS is not initialized!'})
+    data = request.get_json()
+    queries = data.get("queries", [])
+    lang_checks, suggestions = [], []
+    emb_layer = knrm_model['weight']
+    topk = 10
+    # nonlocal documents
+    for query in queries:
+        if detect(query) != "en":
+            lang_checks.append(False)
+            suggestions.append(None)
+        else:
+            lang_checks.append(True)
+
+            query_tokenized = simple_preproc(query)
+            query_token_ids = [vocab.get(tok, vocab["OOV"]) for tok in query_tokenized]
+            query_embedding = emb_layer[query_token_ids].mean(dim=0).reshape(1, -1).numpy()
+
+            inds = faiss_index.search(query_embedding, k=100)
+            candidates = [(str(i), documents[str(i)]) for i in inds[0] if i != -1]
+            outputs = knrm_model({
+                "query": text2token_ids([query * len(candidates)]),
+                "document": text2token_ids([cand[1] for cand in candidates])
+            })
+            topk_candidate_ids = outputs.reshape(-1).argsort(descending=True)[:topk]
+            topk_candidates = [candidates[i] for i in topk_candidate_ids.tolist()]
+            suggestions.append(topk_candidates)
+    return jsonify(lang_check=lang_checks, suggestions=suggestions)
+
+
 if __name__ == "__main__":
-    # Загрузка необходимых файлов
     glove_embeddings = load_glove_embeddings(EMB_PATH_GLOVE)
     vocab = load_vocab(VOCAB_PATH)
-    # Загрузка модели
+    
     knrm_model = KNRM(
       emb_path=EMB_PATH_KNRM,
       mlp_path=MLP_PATH,
     )
-  
+
     app.run(host="0.0.0.0", port=11000)
