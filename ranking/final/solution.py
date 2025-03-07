@@ -12,16 +12,13 @@ from langdetect import detect
 from flask import Flask, request, jsonify
 
 
-# Загрузка путей из переменных окружения
 EMB_PATH_KNRM = os.getenv("EMB_PATH_KNRM")
 EMB_PATH_GLOVE = os.getenv("EMB_PATH_GLOVE")
 VOCAB_PATH = os.getenv("VOCAB_PATH")
 MLP_PATH = os.getenv("MLP_PATH")
 
-# Инициализация Flask-сервера
 app = Flask(__name__)
 
-# Глобальные переменные
 faiss_index = None
 vocab = {}
 knrm_model = None
@@ -75,7 +72,7 @@ class GaussianKernel(torch.nn.Module):
 class KNRM(torch.nn.Module):
     def __init__(self, embedding_path: str, pretrained_mlp_path: str, kernel_num: int = 21,
                  sigma: float = 0.1, exact_sigma: float = 0.001,
-                 out_layers: List[int] = [10, 5]):
+                 out_layers: List[int] = []):
         super().__init__()
         self.embeddings = torch.nn.Embedding.from_pretrained(
             torch.load(embedding_path)["weight"],
@@ -159,14 +156,17 @@ def ping():
 def update_index():
     """Создаёт FAISS-индекс по загруженным вопросам."""
     global faiss_index, index_is_ready, documents
-    data = request.get_json()
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No documents received"})
+    data = json.loads(data)
     documents = data.get("documents", {})
     # nonlocal documents
     if not documents:
         return jsonify({"status": "error", "message": "No documents received"})
     
     oov_val = vocab.get("OOV", 0)
-    emb_layer = knrm_model['weight']
+    emb_layer = knrm_model.embeddings.state_dict()['weight']
     
     idxs, embeddings = [], []
     for doc_id, text in documents.items():
@@ -191,12 +191,16 @@ def get_ranked_candidates():
     Эти кандидаты реранжируются KNRM-моделью, после чего до 10 кандидатов выдаются в качестве ответа.
     """
     global knrm_model, faiss_index, vocab
-    if not index_is_ready:
+    if not index_is_ready or knrm_model is None:
         return jsonify({"status": 'FAISS is not initialized!'})
-    data = request.get_json()
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No queries received"})
+    data = json.loads(data)
     queries = data.get("queries", [])
+    
     lang_checks, suggestions = [], []
-    emb_layer = knrm_model['weight']
+    emb_layer = knrm_model.embeddings.state_dict()['weight']
     topk = 10
     # nonlocal documents
     for query in queries:
@@ -210,8 +214,8 @@ def get_ranked_candidates():
             query_token_ids = [vocab.get(tok, vocab["OOV"]) for tok in query_tokenized]
             query_embedding = emb_layer[query_token_ids].mean(dim=0).reshape(1, -1).numpy()
 
-            inds = faiss_index.search(query_embedding, k=100)
-            candidates = [(str(i), documents[str(i)]) for i in inds[0] if i != -1]
+            _, inds = faiss_index.search(query_embedding, k=10)
+            candidates = [(str(i), documents[str(i)]) for i in inds.reshape(-1)]
             outputs = knrm_model({
                 "query": text2token_ids([query * len(candidates)]),
                 "document": text2token_ids([cand[1] for cand in candidates])
@@ -222,13 +226,13 @@ def get_ranked_candidates():
     return jsonify(lang_check=lang_checks, suggestions=suggestions)
 
 
-if __name__ == "__main__":
-    glove_embeddings = load_glove_embeddings(EMB_PATH_GLOVE)
-    vocab = load_vocab(VOCAB_PATH)
-    
-    knrm_model = KNRM(
-      emb_path=EMB_PATH_KNRM,
-      mlp_path=MLP_PATH,
-    )
 
-    app.run(host="0.0.0.0", port=11000)
+glove_embeddings = load_glove_embeddings(EMB_PATH_GLOVE)
+vocab = load_vocab(VOCAB_PATH)
+
+knrm_model = KNRM(
+    embedding_path=EMB_PATH_KNRM,
+    pretrained_mlp_path=MLP_PATH,
+)
+knrm_model.eval()
+app.run(host="0.0.0.0", port=11000)
